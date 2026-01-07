@@ -12,10 +12,7 @@ import urllib.parse
 
 import urllib3
 
-import bs4
-import dulwich.index
-import dulwich.objects
-import dulwich.pack
+import pygit2
 import requests
 import socks
 from requests_pkcs12 import Pkcs12Adapter
@@ -51,7 +48,9 @@ def is_safe_path(path):
 
 def get_indexed_files(response):
     """Return all the files in the directory index webpage"""
-    html = bs4.BeautifulSoup(response.text, "html.parser")
+    from bs4 import BeautifulSoup
+
+    html = BeautifulSoup(response.text, "html.parser")
     files = []
 
     for link in html.find_all("a"):
@@ -96,25 +95,27 @@ def create_intermediate_dirs(path):
             pass  # race condition
 
 
-def get_referenced_sha1(obj_file):
-    """Return all the referenced SHA1 in the given object file"""
+def get_referenced_sha1(repo, oid):
+    """Return all the referenced OIDs in the given object"""
     objs = []
+    try:
+        obj = repo.get(oid)
+    except Exception:
+        return []
 
-    if isinstance(obj_file, dulwich.objects.Commit):
-        objs.append(obj_file.tree.decode())
-
-        for parent in obj_file.parents:
-            objs.append(parent.decode())
-    elif isinstance(obj_file, dulwich.objects.Tree):
-        for item in obj_file.iteritems():
-            objs.append(item.sha.decode())
-    elif isinstance(obj_file, dulwich.objects.Blob):
+    if isinstance(obj, pygit2.Commit):
+        objs.append(str(obj.tree_id))
+        for parent in obj.parent_ids:
+            objs.append(str(parent))
+    elif isinstance(obj, pygit2.Tree):
+        for entry in obj:
+            objs.append(str(entry.id))
+    elif isinstance(obj, pygit2.Blob):
         pass
-    elif isinstance(obj_file, dulwich.objects.Tag):
-        pass
+    elif isinstance(obj, pygit2.Tag):
+        objs.append(str(obj.target_id))
     else:
-        printf("error: unexpected object type: %r\n" % obj_file, file=sys.stderr)
-        sys.exit(1)
+        printf("error: unexpected object type: %r\n" % type(obj), file=sys.stderr)
 
     return objs
 
@@ -219,7 +220,7 @@ class DownloadWorker(Worker):
             printf("[-] Already downloaded %s\n", filepath)
             return []
 
-        printf("[-] Fetching %s\n", filepath)
+        # printf("[-] Fetching %s\n", filepath)
         try:
             content = self.readfile_callback(filepath)
             if content is None:
@@ -236,6 +237,7 @@ class DownloadWorker(Worker):
         with open(abspath, "wb") as f:
             f.write(content)
 
+        printf("[+] Downloaded %s\n", filepath)
         return []
 
 
@@ -249,7 +251,7 @@ class FindRefsWorker(DownloadWorker):
             with open(os.path.join(self.directory, filepath), "rb") as f:
                 content = f.read()
         else:
-            printf("[-] Fetching %s\n", filepath)
+            # printf("[-] Fetching %s\n", filepath)
             try:
                 content = self.readfile_callback(filepath)
                 if content is None:
@@ -266,6 +268,7 @@ class FindRefsWorker(DownloadWorker):
             with open(abspath, "wb") as f:
                 f.write(content)
 
+            printf("[+] Downloaded %s\n", filepath)
         try:
             text_content = content.decode("utf-8", errors="ignore")
         except Exception:
@@ -292,7 +295,7 @@ class FindObjectsWorker(DownloadWorker):
         if os.path.isfile(os.path.join(self.directory, filepath)):
             printf("[-] Already downloaded %s\n", filepath)
         else:
-            printf("[-] Fetching %s\n", filepath)
+            # printf("[-] Fetching %s\n", filepath)
             try:
                 content = self.readfile_callback(filepath)
                 if content is None:
@@ -308,12 +311,12 @@ class FindObjectsWorker(DownloadWorker):
             # write file
             with open(abspath, "wb") as f:
                 f.write(content)
+            printf("[+] Downloaded %s\n", filepath)
 
-        abspath = os.path.abspath(os.path.join(self.directory, filepath))
         # parse object file to find other objects
         try:
-            obj_file = dulwich.objects.ShaFile.from_path(abspath)
-            return get_referenced_sha1(obj_file)
+            repo = pygit2.Repository(os.path.join(self.directory, ".git"))
+            return get_referenced_sha1(repo, obj)
         except Exception as e:
             printf("[-] Error parsing object %s: %s\n", obj, e, file=sys.stderr)
             return []
@@ -534,25 +537,25 @@ class GitDumper:
         # use .git/index to find objects
         index_path = os.path.join(self.directory, ".git", "index")
         if os.path.exists(index_path):
-            index = dulwich.index.Index(index_path)
-
-            for entry in index.iterobjects():
-                objs.add(entry[1].decode())
+            try:
+                repo = pygit2.Repository(os.path.join(self.directory, ".git"))
+                for entry in repo.index:
+                    objs.add(str(entry.id))
+            except Exception as e:
+                printf("[-] Error reading index: %s\n", e, file=sys.stderr)
 
         # use packs to find more objects to fetch, and objects that are packed
         pack_file_dir = os.path.join(self.directory, ".git", "objects", "pack")
         if os.path.isdir(pack_file_dir):
-            for filename in os.listdir(pack_file_dir):
-                if filename.startswith("pack-") and filename.endswith(".pack"):
-                    pack_data_path = os.path.join(pack_file_dir, filename)
-                    pack_idx_path = os.path.join(pack_file_dir, filename[:-5] + ".idx")
-                    pack_data = dulwich.pack.PackData(pack_data_path)
-                    pack_idx = dulwich.pack.load_pack_index(pack_idx_path)
-                    pack = dulwich.pack.Pack.from_objects(pack_data, pack_idx)
-
-                    for obj_file in pack.iterobjects():
-                        packed_objs.add(obj_file.sha().hexdigest())
-                        objs |= set(get_referenced_sha1(obj_file))
+            try:
+                repo = pygit2.Repository(os.path.join(self.directory, ".git"))
+                # pygit2 automatically loads packs found in the repository
+                # We can iterate over all OIDs known to the repository
+                for oid in repo:
+                    packed_objs.add(str(oid))
+                    objs |= set(get_referenced_sha1(repo, str(oid)))
+            except Exception as e:
+                printf("[-] Error reading packs: %s\n", e, file=sys.stderr)
 
         # fetch all objects
         printf("[-] Fetching objects\n")
